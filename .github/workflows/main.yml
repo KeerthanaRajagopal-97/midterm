@@ -1,24 +1,27 @@
-name: CI/CD → ECS (build & deploy)
+name: Build & Deploy to AWS ECS
 
+# Trigger on push to main (you can add pull_request if you want)
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPOSITORY: wild-rydes
-  CLUSTER: wild-rydes-cluster
-  SERVICE: wild-rydes-service
+concurrency:
+  group: midterm
+  cancel-in-progress: true
 
 jobs:
-  build_and_deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU (optional, for multi-arch) 
+        uses: docker/setup-qemu-action@v3
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -26,50 +29,42 @@ jobs:
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Docker image
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+      - name: Build image and push to ECR
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-
-      - name: Tag & Push to ECR
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker tag ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
-        env:
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          set -e
+          IMAGE_TAG=$(date +%s)
+          REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_NAME=${REGISTRY}/${ECR_REPOSITORY}:$IMAGE_TAG
 
-      - name: Render Task Definition (update image)
+          echo "Building image $IMAGE_NAME"
+          docker build -t $IMAGE_NAME .
+
+          echo "Pushing image to ECR"
+          docker push $IMAGE_NAME
+
+          echo "IMAGE_TO_DEPLOY=$IMAGE_NAME" >> $GITHUB_ENV
+
+      - name: Register new task definition (override image)
+        # This step assumes you have a task definition file (task-def.json) in repo
         run: |
-          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
-          cat > taskdef.json <<EOF
-{
-  "containerDefinitions": [
-    {
-      "name": "${ECR_REPOSITORY}",
-      "image": "${IMAGE_URI}",
-      "essential": true,
-      "portMappings": [
-        { "containerPort": 8080, "protocol": "tcp" }
-      ]
-    }
-  ],
-  "family": "${ECR_REPOSITORY}"
-}
-EOF
+          set -e
+          # Replace the "containerDefinitions" image with our new image using jq.
+          # Create a temporary taskdef file with updated image.
+          jq --arg IMAGE "$IMAGE_TO_DEPLOY" '.containerDefinitions[0].image = $IMAGE' task-def.json > task-def-updated.json
+          aws ecs register-task-definition \
+            --cli-input-json file://task-def-updated.json \
+            --region ${{ secrets.AWS_REGION }}
         env:
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          GITHUB_SHA: ${{ github.sha }}
+          IMAGE_TO_DEPLOY: ${{ env.IMAGE_TO_DEPLOY }}
 
-      - name: Deploy to ECS (register task & update service)
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: taskdef.json
-          service: ${{ env.SERVICE }}
-          cluster: ${{ env.CLUSTER }}
-          wait-for-service-stability: true
+      - name: Deploy service (update service to use the new task definition)
+        run: |
+          # Find the family revision we just registered and update the service
+          TASK_FAMILY=$(jq -r '.family' task-def.json)
+          NEW_REVISION=$(aws ecs list-task-definitions --family-prefix "$TASK_FAMILY" --status ACTIVE --region ${{ secrets.AWS_REGION }} --query 'sort_by(taskDefinitionArns,&@)[-1]' --output text)
+          echo "New task definition ARN: $NEW_REVISION"
+          aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} --service ${{ secrets.ECS_SERVICE }} --task-definition "$NEW_REVISION" --region ${{ secrets.AWS_REGION }}
